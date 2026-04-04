@@ -32,14 +32,20 @@ func (s *Store) Sync(client *AIspaceClient) (*SyncResult, error) {
 	}
 
 	if len(pending) > 0 {
-		if err := client.PushObservations(pending); err != nil {
+		// Push y obtener los IDs remotos
+		pushedObs, err := client.PushObservationsWithResponse(pending)
+		if err != nil {
 			return nil, fmt.Errorf("push observations: %w", err)
 		}
 
-		// Marcar como sincronizadas
+		// Marcar como sincronizadas y guardar sync_id
 		now := time.Now()
-		for _, obs := range pending {
-			if err := s.MarkSynced(obs.ID, now); err != nil {
+		for i, obs := range pending {
+			syncID := ""
+			if i < len(pushedObs) && pushedObs[i].ID > 0 {
+				syncID = fmt.Sprintf("%d", pushedObs[i].ID)
+			}
+			if err := s.MarkSyncedWithSyncID(obs.ID, now, syncID); err != nil {
 				result.Errors++
 				continue
 			}
@@ -112,6 +118,16 @@ func (s *Store) MarkSynced(id int64, syncedAt time.Time) error {
 	return err
 }
 
+// MarkSyncedWithSyncID marca una observación como sincronizada y guarda el ID remoto
+func (s *Store) MarkSyncedWithSyncID(id int64, syncedAt time.Time, syncID string) error {
+	_, err := s.db.Exec(`
+		UPDATE observations
+		SET sync_status = 'synced', synced_at = ?, sync_id = ?
+		WHERE id = ?
+	`, syncedAt.Format(time.RFC3339), syncID, id)
+	return err
+}
+
 // UpsertObservation inserta o actualiza una observación desde la API
 func (s *Store) UpsertObservation(obs Observation) error {
 	// Asegurar que la sesión existe
@@ -119,41 +135,101 @@ func (s *Store) UpsertObservation(obs Observation) error {
 		return fmt.Errorf("ensure session: %w", err)
 	}
 
-	// Usar topic_key como identificador único si existe, si no usar created_at + title
-	// Last-write-wins: actualizar si updated_at remoto > updated_at local
+	// Estrategia de deduplicación:
+	// 1. Si tiene ID de la API (obs.ID > 0), buscar por sync_id
+	// 2. Si tiene topic_key, buscar por topic_key + project
+	// 3. Si no, buscar por title + created_at (similar contenido)
 
 	// Parse timestamps for comparison
 	obsUpdatedAt, _ := time.Parse(time.RFC3339, obs.UpdatedAt)
 
-	if obs.TopicKey != nil && *obs.TopicKey != "" {
-		// Buscar por topic_key
+	// 1. Buscar por sync_id (ID remoto)
+	if obs.ID > 0 {
 		var existingID int64
 		var existingUpdatedAtStr string
 		err := s.db.QueryRow(`
 			SELECT id, updated_at FROM observations
-			WHERE topic_key = ? AND project = ?
-		`, *obs.TopicKey, obs.Project).Scan(&existingID, &existingUpdatedAtStr)
+			WHERE sync_id = ?
+		`, fmt.Sprintf("%d", obs.ID)).Scan(&existingID, &existingUpdatedAtStr)
 
 		if err == nil {
-			// Existe - comparar timestamps
+			// Ya existe - actualizar si es más reciente
 			existingUpdatedAt, _ := time.Parse(time.RFC3339, existingUpdatedAtStr)
 			if obsUpdatedAt.After(existingUpdatedAt) {
-				// Actualizar
 				_, err = s.db.Exec(`
 					UPDATE observations
-					SET type = ?, title = ?, content = ?, updated_at = ?, sync_status = 'synced', synced_at = ?
+					SET type = ?, title = ?, content = ?, project = ?, scope = ?, updated_at = ?, sync_status = 'synced', synced_at = ?
 					WHERE id = ?
-				`, obs.Type, obs.Title, obs.Content, obs.UpdatedAt, time.Now().Format(time.RFC3339), existingID)
+				`, obs.Type, obs.Title, obs.Content, obs.Project, obs.Scope, obs.UpdatedAt, time.Now().Format(time.RFC3339), existingID)
 			}
 			return err
 		}
 	}
 
-	// No existe - insertar
+	// 2. Buscar por topic_key + project
+	if obs.TopicKey != nil && *obs.TopicKey != "" {
+		var existingID int64
+		var existingUpdatedAtStr string
+		err := s.db.QueryRow(`
+			SELECT id, updated_at FROM observations
+			WHERE topic_key = ? AND (project = ? OR (project IS NULL AND ? IS NULL))
+		`, *obs.TopicKey, obs.Project, obs.Project).Scan(&existingID, &existingUpdatedAtStr)
+
+		if err == nil {
+			// Existe - comparar timestamps
+			existingUpdatedAt, _ := time.Parse(time.RFC3339, existingUpdatedAtStr)
+			if obsUpdatedAt.After(existingUpdatedAt) {
+				// Actualizar y guardar sync_id
+				syncIDStr := ""
+				if obs.ID > 0 {
+					syncIDStr = fmt.Sprintf("%d", obs.ID)
+				}
+				_, err = s.db.Exec(`
+					UPDATE observations
+					SET type = ?, title = ?, content = ?, updated_at = ?, sync_status = 'synced', synced_at = ?, sync_id = ?
+					WHERE id = ?
+				`, obs.Type, obs.Title, obs.Content, obs.UpdatedAt, time.Now().Format(time.RFC3339), syncIDStr, existingID)
+			}
+			return err
+		}
+	}
+
+	// 3. Buscar por title + session_id (observaciones en la misma sesión)
+	if obs.SessionID != "" {
+		var existingID int64
+		var existingUpdatedAtStr string
+		err := s.db.QueryRow(`
+			SELECT id, updated_at FROM observations
+			WHERE title = ? AND session_id = ?
+		`, obs.Title, obs.SessionID).Scan(&existingID, &existingUpdatedAtStr)
+
+		if err == nil {
+			// Ya existe en la misma sesión con el mismo título - actualizar
+			existingUpdatedAt, _ := time.Parse(time.RFC3339, existingUpdatedAtStr)
+			if obsUpdatedAt.After(existingUpdatedAt) {
+				syncIDStr := ""
+				if obs.ID > 0 {
+					syncIDStr = fmt.Sprintf("%d", obs.ID)
+				}
+				_, err = s.db.Exec(`
+					UPDATE observations
+					SET type = ?, content = ?, project = ?, scope = ?, updated_at = ?, sync_status = 'synced', synced_at = ?, sync_id = ?
+					WHERE id = ?
+				`, obs.Type, obs.Content, obs.Project, obs.Scope, obs.UpdatedAt, time.Now().Format(time.RFC3339), syncIDStr, existingID)
+			}
+			return err
+		}
+	}
+
+	// No existe - insertar nuevo
+	syncIDStr := ""
+	if obs.ID > 0 {
+		syncIDStr = fmt.Sprintf("%d", obs.ID)
+	}
 	_, err := s.db.Exec(`
-		INSERT INTO observations (session_id, type, title, content, project, scope, topic_key, created_at, updated_at, sync_status, synced_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'synced', ?)
-	`, obs.SessionID, obs.Type, obs.Title, obs.Content, obs.Project, obs.Scope, obs.TopicKey,
+		INSERT INTO observations (sync_id, session_id, type, title, content, project, scope, topic_key, created_at, updated_at, sync_status, synced_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'synced', ?)
+	`, syncIDStr, obs.SessionID, obs.Type, obs.Title, obs.Content, obs.Project, obs.Scope, obs.TopicKey,
 		obs.CreatedAt, obs.UpdatedAt, time.Now().Format(time.RFC3339))
 	return err
 }
