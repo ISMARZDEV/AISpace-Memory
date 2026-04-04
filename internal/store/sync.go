@@ -114,6 +114,11 @@ func (s *Store) MarkSynced(id int64, syncedAt time.Time) error {
 
 // UpsertObservation inserta o actualiza una observación desde la API
 func (s *Store) UpsertObservation(obs Observation) error {
+	// Asegurar que la sesión existe
+	if err := s.ensureSession(obs.SessionID, obs.Project); err != nil {
+		return fmt.Errorf("ensure session: %w", err)
+	}
+
 	// Usar topic_key como identificador único si existe, si no usar created_at + title
 	// Last-write-wins: actualizar si updated_at remoto > updated_at local
 
@@ -150,6 +155,32 @@ func (s *Store) UpsertObservation(obs Observation) error {
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'synced', ?)
 	`, obs.SessionID, obs.Type, obs.Title, obs.Content, obs.Project, obs.Scope, obs.TopicKey,
 		obs.CreatedAt, obs.UpdatedAt, time.Now().Format(time.RFC3339))
+	return err
+}
+
+// ensureSession crea la sesión si no existe
+func (s *Store) ensureSession(sessionID string, project *string) error {
+	if sessionID == "" {
+		return nil
+	}
+
+	// Verificar si existe
+	var exists int
+	err := s.db.QueryRow(`SELECT 1 FROM sessions WHERE id = ?`, sessionID).Scan(&exists)
+	if err == nil {
+		return nil // Ya existe
+	}
+
+	// Crear sesión con valores por defecto
+	projectVal := "unknown"
+	if project != nil && *project != "" {
+		projectVal = *project
+	}
+
+	_, err = s.db.Exec(`
+		INSERT OR IGNORE INTO sessions (id, project, directory, started_at)
+		VALUES (?, ?, '/synced', datetime('now'))
+	`, sessionID, projectVal)
 	return err
 }
 
