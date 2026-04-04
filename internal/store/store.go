@@ -440,36 +440,36 @@ func (s *Store) migrate() error {
 	schema := `
 			CREATE TABLE IF NOT EXISTS sessions (
 				id         TEXT PRIMARY KEY,
-			project    TEXT NOT NULL,
-			directory  TEXT NOT NULL,
-			started_at TEXT NOT NULL DEFAULT (datetime('now')),
-			ended_at   TEXT,
-			summary    TEXT
-		);
+				project    TEXT NOT NULL,
+				directory  TEXT NOT NULL,
+				started_at TEXT NOT NULL DEFAULT (datetime('now')),
+				ended_at   TEXT,
+				summary    TEXT
+			);
 
-CREATE TABLE IF NOT EXISTS observations (
-			id         INTEGER PRIMARY KEY AUTOINCREMENT,
-			sync_id    TEXT,
-			session_id TEXT    NOT NULL,
-			type       TEXT    NOT NULL,
-			title      TEXT    NOT NULL,
-			content    TEXT    NOT NULL,
-			tool_name  TEXT,
-			project    TEXT,
-			scope      TEXT    NOT NULL DEFAULT 'project',
-			topic_key  TEXT,
-			normalized_hash TEXT,
-			revision_count INTEGER NOT NULL DEFAULT 1,
-			duplicate_count INTEGER NOT NULL DEFAULT 1,
-			last_seen_at TEXT,
-			created_at TEXT    NOT NULL DEFAULT (datetime('now')),
-			updated_at TEXT    NOT NULL DEFAULT (datetime('now')),
-			deleted_at TEXT,
-			user_id     TEXT,
-			sync_status TEXT    DEFAULT 'pending',
-			synced_at   TEXT,
-			FOREIGN KEY (session_id) REFERENCES sessions(id)
-		);
+			CREATE TABLE IF NOT EXISTS observations (
+				id         INTEGER PRIMARY KEY AUTOINCREMENT,
+				sync_id    TEXT,
+				session_id TEXT    NOT NULL,
+				type       TEXT    NOT NULL,
+				title      TEXT    NOT NULL,
+				content    TEXT    NOT NULL,
+				tool_name  TEXT,
+				project    TEXT,
+				scope      TEXT    NOT NULL DEFAULT 'project',
+				topic_key  TEXT,
+				normalized_hash TEXT,
+				revision_count INTEGER NOT NULL DEFAULT 1,
+				duplicate_count INTEGER NOT NULL DEFAULT 1,
+				last_seen_at TEXT,
+				created_at TEXT    NOT NULL DEFAULT (datetime('now')),
+				updated_at TEXT    NOT NULL DEFAULT (datetime('now')),
+				deleted_at TEXT,
+				user_id     TEXT,
+				sync_status TEXT    DEFAULT 'pending',
+				synced_at   TEXT,
+				FOREIGN KEY (session_id) REFERENCES sessions(id)
+			);
 
 		CREATE INDEX IF NOT EXISTS idx_obs_session  ON observations(session_id);
 		CREATE INDEX IF NOT EXISTS idx_obs_type     ON observations(type);
@@ -491,11 +491,11 @@ CREATE TABLE IF NOT EXISTS observations (
 				id         INTEGER PRIMARY KEY AUTOINCREMENT,
 				sync_id    TEXT,
 				session_id TEXT    NOT NULL,
-			content    TEXT    NOT NULL,
-			project    TEXT,
-			created_at TEXT    NOT NULL DEFAULT (datetime('now')),
-			FOREIGN KEY (session_id) REFERENCES sessions(id)
-		);
+				content    TEXT    NOT NULL,
+				project    TEXT,
+				created_at TEXT    NOT NULL DEFAULT (datetime('now')),
+				FOREIGN KEY (session_id) REFERENCES sessions(id)
+			);
 
 		CREATE INDEX IF NOT EXISTS idx_prompts_session ON user_prompts(session_id);
 		CREATE INDEX IF NOT EXISTS idx_prompts_project ON user_prompts(project);
@@ -513,26 +513,24 @@ CREATE TABLE IF NOT EXISTS observations (
 				imported_at TEXT NOT NULL DEFAULT (datetime('now'))
 			);
 
-CREATE TABLE IF NOT EXISTS sync_state (
-			target_key           TEXT PRIMARY KEY,
-			lifecycle            TEXT NOT NULL DEFAULT 'idle',
-			last_enqueued_seq    INTEGER NOT NULL DEFAULT 0,
-			last_acked_seq       INTEGER NOT NULL DEFAULT 0,
-			last_pulled_seq      INTEGER NOT NULL DEFAULT 0,
-			consecutive_failures INTEGER NOT NULL DEFAULT 0,
-			backoff_until        TEXT,
-			lease_owner          TEXT,
-			lease_expires        TEXT
-		);
+			CREATE TABLE IF NOT EXISTS sync_state (
+				target_key           TEXT PRIMARY KEY,
+				lifecycle            TEXT NOT NULL DEFAULT 'idle',
+				last_enqueued_seq    INTEGER NOT NULL DEFAULT 0,
+				last_acked_seq       INTEGER NOT NULL DEFAULT 0,
+				last_pulled_seq      INTEGER NOT NULL DEFAULT 0,
+				consecutive_failures INTEGER NOT NULL DEFAULT 0,
+				backoff_until        TEXT,
+				lease_owner          TEXT,
+				lease_until          TEXT,
+				last_error           TEXT,
+				updated_at           TEXT NOT NULL DEFAULT (datetime('now'))
+			);
 
 		CREATE TABLE IF NOT EXISTS config (
 			key   TEXT PRIMARY KEY,
 			value TEXT NOT NULL
 		);
-				lease_until          TEXT,
-				last_error           TEXT,
-				updated_at           TEXT NOT NULL DEFAULT (datetime('now'))
-			);
 
 			CREATE TABLE IF NOT EXISTS sync_mutations (
 				seq         INTEGER PRIMARY KEY AUTOINCREMENT,
