@@ -447,10 +447,10 @@ func (s *Store) migrate() error {
 			summary    TEXT
 		);
 
-			CREATE TABLE IF NOT EXISTS observations (
-				id         INTEGER PRIMARY KEY AUTOINCREMENT,
-				sync_id    TEXT,
-				session_id TEXT    NOT NULL,
+CREATE TABLE IF NOT EXISTS observations (
+			id         INTEGER PRIMARY KEY AUTOINCREMENT,
+			sync_id    TEXT,
+			session_id TEXT    NOT NULL,
 			type       TEXT    NOT NULL,
 			title      TEXT    NOT NULL,
 			content    TEXT    NOT NULL,
@@ -465,6 +465,9 @@ func (s *Store) migrate() error {
 			created_at TEXT    NOT NULL DEFAULT (datetime('now')),
 			updated_at TEXT    NOT NULL DEFAULT (datetime('now')),
 			deleted_at TEXT,
+			user_id     TEXT,
+			sync_status TEXT    DEFAULT 'pending',
+			synced_at   TEXT,
 			FOREIGN KEY (session_id) REFERENCES sessions(id)
 		);
 
@@ -510,15 +513,22 @@ func (s *Store) migrate() error {
 				imported_at TEXT NOT NULL DEFAULT (datetime('now'))
 			);
 
-			CREATE TABLE IF NOT EXISTS sync_state (
-				target_key           TEXT PRIMARY KEY,
-				lifecycle            TEXT NOT NULL DEFAULT 'idle',
-				last_enqueued_seq    INTEGER NOT NULL DEFAULT 0,
-				last_acked_seq       INTEGER NOT NULL DEFAULT 0,
-				last_pulled_seq      INTEGER NOT NULL DEFAULT 0,
-				consecutive_failures INTEGER NOT NULL DEFAULT 0,
-				backoff_until        TEXT,
-				lease_owner          TEXT,
+CREATE TABLE IF NOT EXISTS sync_state (
+			target_key           TEXT PRIMARY KEY,
+			lifecycle            TEXT NOT NULL DEFAULT 'idle',
+			last_enqueued_seq    INTEGER NOT NULL DEFAULT 0,
+			last_acked_seq       INTEGER NOT NULL DEFAULT 0,
+			last_pulled_seq      INTEGER NOT NULL DEFAULT 0,
+			consecutive_failures INTEGER NOT NULL DEFAULT 0,
+			backoff_until        TEXT,
+			lease_owner          TEXT,
+			lease_expires        TEXT
+		);
+
+		CREATE TABLE IF NOT EXISTS config (
+			key   TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);
 				lease_until          TEXT,
 				last_error           TEXT,
 				updated_at           TEXT NOT NULL DEFAULT (datetime('now'))
