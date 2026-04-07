@@ -1,4 +1,4 @@
-.PHONY: build clean test install all
+.PHONY: build clean test install all uninstall
 
 # Binary name
 BINARY=aispace-men
@@ -49,9 +49,24 @@ clean:
 	rm -f $(BUILD_DIR)$(BINARY)
 	rm -f $(BUILD_DIR)$(BINARY)-*
 
-# Install locally
+# Install locally — copies to all locations that may appear in PATH
+# so there are never two different versions coexisting.
 install: build
-	cp $(BUILD_DIR)$(BINARY) $(HOME)/.local/bin/
+	@mkdir -p $(HOME)/.local/bin
+	cp $(BUILD_DIR)$(BINARY) $(HOME)/.local/bin/$(BINARY)
+	@if [ -d $(HOME)/go/bin ]; then cp $(BUILD_DIR)$(BINARY) $(HOME)/go/bin/$(BINARY); fi
+	@if [ -d /opt/homebrew/bin ] && [ -f /opt/homebrew/bin/$(BINARY) ]; then cp $(BUILD_DIR)$(BINARY) /opt/homebrew/bin/$(BINARY); fi
+	@echo "Installed $(BINARY) $(VERSION)"
+	@echo "  → $(HOME)/.local/bin/$(BINARY)"
+	@if [ -d $(HOME)/go/bin ]; then echo "  → $(HOME)/go/bin/$(BINARY)"; fi
+	@if [ -d /opt/homebrew/bin ] && [ -f /opt/homebrew/bin/$(BINARY) ]; then echo "  → /opt/homebrew/bin/$(BINARY)"; fi
+
+# Remove all installed copies
+uninstall:
+	@rm -f $(HOME)/.local/bin/$(BINARY)
+	@rm -f $(HOME)/go/bin/$(BINARY)
+	@rm -f /opt/homebrew/bin/$(BINARY)
+	@echo "Uninstalled $(BINARY)"
 
 # Run the MCP server (for testing)
 run-mcp:

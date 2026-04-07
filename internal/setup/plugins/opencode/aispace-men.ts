@@ -5,11 +5,11 @@
  * The Go binary runs as an MCP server (stdio transport) and handles all persistence.
  */
 
-import type { Plugin } from "@opencode-ai/plugin"
+import type { Plugin } from "@opencode-ai/plugin";
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
-const AISPACE_MEN_BIN = process.env.AISPACE_MEN_BIN ?? "aispace-men"
+const AISPACE_MEN_BIN = process.env.AISPACE_MEN_BIN ?? "aispace-men";
 
 // aispace-men's own MCP tools — don't count these as "tool calls" for session stats
 const AISPACE_MEN_TOOLS = new Set([
@@ -26,7 +26,7 @@ const AISPACE_MEN_TOOLS = new Set([
   "mem_get_observation",
   "mem_session_start",
   "mem_session_end",
-])
+]);
 
 // ─── Memory Instructions ─────────────────────────────────────────────────────
 // These get injected into the agent's context so it knows to call mem_save.
@@ -99,24 +99,49 @@ Before ending a session or saying "done" / "listo" / "that's it", you MUST:
 - path/to/file — [what it does or what changed]
 
 This is NOT optional. If you skip this, the next session starts blind.
-`
+`;
 
 // ─── Plugin Export ───────────────────────────────────────────────────────────
 
 export const AispaceMen: Plugin = async (ctx) => {
-  const project = ctx.directory.split("/").pop() ?? "unknown"
+  // ctx.directory is the active workspace directory in OpenCode.
+  // We pass it verbatim to the agent so it can include it in every mem_* call
+  // as the `cwd` parameter. The Go server then re-detects the project from that
+  // path on every tool call — reading .aispace-men.json, go.mod, package.json,
+  // Cargo.toml, pyproject.toml, git remote, etc. — instead of using only the
+  // startup-time detection.
+  const cwd = ctx.directory;
+
+  // Build context-aware instructions with the live working directory injected.
+  const contextualInstructions =
+    MEMORY_INSTRUCTIONS +
+    `
+
+### Current Working Directory
+
+Your current working directory is: \`${cwd}\`
+
+IMPORTANT: Pass \`cwd: "${cwd}"\` in EVERY call to \`mem_save\`, \`mem_search\`, and \`mem_context\` when you do not explicitly set the \`project\` parameter. This lets the server detect the correct project automatically from your filesystem (reads .aispace-men.json, go.mod, package.json, git remote, etc.).
+
+Example:
+  mem_save(title: "...", content: "...", cwd: "${cwd}")
+  mem_context(cwd: "${cwd}")
+  mem_search(query: "...", cwd: "${cwd}")
+`;
 
   return {
     // ─── System Prompt: Always-on memory instructions ──────────
-    // Injects MEMORY_INSTRUCTIONS into the system prompt of every message.
-    // This ensures the agent ALWAYS knows about Aispace-Men, even after compaction.
+    // Injects context-aware MEMORY_INSTRUCTIONS into every message system prompt.
+    // This ensures the agent ALWAYS knows about Aispace-Men and passes cwd correctly,
+    // even after compaction.
 
     "experimental.chat.system.transform": async (_input, output) => {
       if (output.system.length > 0) {
-        output.system[output.system.length - 1] += "\n\n" + MEMORY_INSTRUCTIONS
+        output.system[output.system.length - 1] +=
+          "\n\n" + contextualInstructions;
       } else {
-        output.system.push(MEMORY_INSTRUCTIONS)
+        output.system.push(contextualInstructions);
       }
     },
-  }
-}
+  };
+};

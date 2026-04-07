@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -23,6 +24,8 @@ import (
 )
 
 var openDB = sql.Open
+
+const currentSchemaVersion = 1
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -37,8 +40,10 @@ type Session struct {
 
 type Observation struct {
 	ID             int64   `json:"id"`
-	SyncID         string  `json:"sync_id"`
+	SyncID         string  `json:"sync_id" db:"sync_id"`
+	SyncIDCamel    string  `json:"syncId,omitempty"` // API returns camelCase
 	SessionID      string  `json:"session_id"`
+	SessionIDCamel string  `json:"sessionId,omitempty"` // API returns camelCase
 	Type           string  `json:"type"`
 	Title          string  `json:"title"`
 	Content        string  `json:"content"`
@@ -46,12 +51,26 @@ type Observation struct {
 	Project        *string `json:"project,omitempty"`
 	Scope          string  `json:"scope"`
 	TopicKey       *string `json:"topic_key,omitempty"`
+	TopicKeyCamel  *string `json:"topicKey,omitempty"` // API returns camelCase
 	RevisionCount  int     `json:"revision_count"`
 	DuplicateCount int     `json:"duplicate_count"`
 	LastSeenAt     *string `json:"last_seen_at,omitempty"`
 	CreatedAt      string  `json:"created_at"`
 	UpdatedAt      string  `json:"updated_at"`
 	DeletedAt      *string `json:"deleted_at,omitempty"`
+}
+
+// NormalizePulled fills snake_case fields from camelCase equivalents after JSON decode from API
+func (o *Observation) NormalizePulled() {
+	if o.SyncID == "" && o.SyncIDCamel != "" {
+		o.SyncID = o.SyncIDCamel
+	}
+	if o.SessionID == "" && o.SessionIDCamel != "" {
+		o.SessionID = o.SessionIDCamel
+	}
+	if o.TopicKey == nil && o.TopicKeyCamel != nil {
+		o.TopicKey = o.TopicKeyCamel
+	}
 }
 
 type SearchResult struct {
@@ -426,6 +445,9 @@ func New(cfg Config) (*Store, error) {
 	if err := s.repairEnrolledProjectSyncMutations(); err != nil {
 		return nil, fmt.Errorf("engram: repair enrolled sync journal: %w", err)
 	}
+	if _, err := s.PurgeAckedMutations("cloud", 30*24*time.Hour); err != nil {
+		log.Printf("[store] warn: could not purge old sync mutations: %v", err)
+	}
 
 	return s, nil
 }
@@ -437,7 +459,23 @@ func (s *Store) Close() error {
 // ─── Migrations ──────────────────────────────────────────────────────────────
 
 func (s *Store) migrate() error {
+	var v int
+	if err := s.db.QueryRow("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1").Scan(&v); err == nil {
+		if v >= currentSchemaVersion {
+			return nil
+		}
+	}
+
+	// Mark legacy sync columns as deprecated — no longer written or read
+	// (Cannot DROP COLUMN in SQLite < 3.35 — columns remain but are ignored)
+	// No action needed — columns stay in schema but no code reads/writes them
+
 	schema := `
+			CREATE TABLE IF NOT EXISTS schema_version (
+				version  INTEGER NOT NULL,
+				migrated_at TEXT NOT NULL DEFAULT (datetime('now'))
+			);
+
 			CREATE TABLE IF NOT EXISTS sessions (
 				id         TEXT PRIMARY KEY,
 				project    TEXT NOT NULL,
@@ -627,14 +665,18 @@ func (s *Store) migrate() error {
 	if _, err := s.execHook(s.db, `UPDATE observations SET updated_at = created_at WHERE updated_at IS NULL OR updated_at = ''`); err != nil {
 		return err
 	}
-	if _, err := s.execHook(s.db, `UPDATE observations SET sync_id = 'obs-' || lower(hex(randomblob(16))) WHERE sync_id IS NULL OR sync_id = ''`); err != nil {
+	// Generate valid UUIDv4 format for sync_id (no prefix, just UUID)
+	// SQLite UUID v4 format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
+	// Uses single randomblob(16) and formats with proper version/variant bits
+	if _, err := s.execHook(s.db, `UPDATE observations SET sync_id = (SELECT lower(substr(h, 1, 8) || '-' || substr(h, 9, 4) || '-4' || substr(h, 13, 3) || '-' || substr('89ab', (random() & 3) + 1, 1) || substr(h, 17, 3) || '-' || substr(h, 21, 12)) FROM (SELECT hex(randomblob(16)) AS h)) WHERE sync_id IS NULL OR sync_id = '' OR sync_id LIKE 'obs-%'`); err != nil {
 		return err
 	}
 
 	if _, err := s.execHook(s.db, `UPDATE user_prompts SET project = '' WHERE project IS NULL`); err != nil {
 		return err
 	}
-	if _, err := s.execHook(s.db, `UPDATE user_prompts SET sync_id = 'prompt-' || lower(hex(randomblob(16))) WHERE sync_id IS NULL OR sync_id = ''`); err != nil {
+	// Generate valid UUIDv4 format for user_prompts sync_id
+	if _, err := s.execHook(s.db, `UPDATE user_prompts SET sync_id = (SELECT lower(substr(h, 1, 8) || '-' || substr(h, 9, 4) || '-4' || substr(h, 13, 3) || '-' || substr('89ab', (random() & 3) + 1, 1) || substr(h, 17, 3) || '-' || substr(h, 21, 12)) FROM (SELECT hex(randomblob(16)) AS h)) WHERE sync_id IS NULL OR sync_id = '' OR sync_id LIKE 'prompt-%'`); err != nil {
 		return err
 	}
 	if _, err := s.execHook(s.db, `INSERT OR IGNORE INTO sync_state (target_key, lifecycle, updated_at) VALUES ('cloud', 'idle', datetime('now'))`); err != nil {
@@ -705,7 +747,8 @@ func (s *Store) migrate() error {
 		}
 	}
 
-	return nil
+	_, err = s.db.Exec(`INSERT OR REPLACE INTO schema_version (version) VALUES (?)`, currentSchemaVersion)
+	return err
 }
 
 func (s *Store) migrateFTSTopicKey() error {
@@ -765,6 +808,10 @@ func (s *Store) CreateSession(id, project, directory string) error {
 
 	return s.withTx(func(tx *sql.Tx) error {
 		if err := s.createSessionTx(tx, id, project, directory); err != nil {
+			return err
+		}
+		// Auto-enroll project for cloud sync
+		if err := s.enrollProjectTx(tx, project); err != nil {
 			return err
 		}
 		return s.enqueueSyncMutationTx(tx, SyncEntitySession, id, SyncOpUpsert, syncSessionPayload{
@@ -970,6 +1017,13 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 
 	var observationID int64
 	err := s.withTx(func(tx *sql.Tx) error {
+		// Auto-enroll project for cloud sync
+		if p.Project != "" {
+			if err := s.enrollProjectTx(tx, p.Project); err != nil {
+				return err
+			}
+		}
+
 		var obs *Observation
 		if topicKey != "" {
 			var existingID int64
@@ -1106,7 +1160,15 @@ func (s *Store) RecentObservations(project, scope string, limit int) ([]Observat
 		args = append(args, normalizeScope(scope))
 	}
 
-	query += " ORDER BY o.created_at DESC LIMIT ?"
+	query += ` ORDER BY (
+		CASE 
+			WHEN o.type IN ('session_summary', 'decision', 'architecture') THEN 3.0
+			WHEN o.type IN ('bugfix', 'pattern', 'config', 'discovery') THEN 2.0
+			ELSE 1.0
+		END
+		* MIN(1.0 + o.revision_count * 0.15, 2.0)
+		/ (julianday('now') - julianday(o.updated_at) + 1.0)
+	) DESC LIMIT ?`
 	args = append(args, limit)
 
 	return s.queryObservations(query, args...)
@@ -1125,10 +1187,35 @@ func (s *Store) AddPrompt(p AddPromptParams) (int64, error) {
 
 	var promptID int64
 	err := s.withTx(func(tx *sql.Tx) error {
+		// Auto-enroll project for cloud sync
+		if p.Project != "" {
+			if err := s.enrollProjectTx(tx, p.Project); err != nil {
+				return err
+			}
+		}
+
+		// Deduplication: skip if identical content was saved in the last 15 minutes
+		hash := hashNormalized(content)
+		window := dedupeWindowExpression(s.cfg.DedupeWindow)
+		var existingID int64
+		err := tx.QueryRow(`
+			SELECT id FROM user_prompts
+			WHERE normalized_hash = ?
+			  AND ifnull(project, '') = ifnull(?, '')
+			  AND datetime(created_at) >= datetime('now', ?)
+			ORDER BY created_at DESC
+			LIMIT 1`,
+			hash, nullableString(p.Project), window,
+		).Scan(&existingID)
+		if err == nil && existingID > 0 {
+			promptID = existingID
+			return nil // duplicate — skip insert
+		}
+
 		syncID := newSyncID("prompt")
 		res, err := s.execHook(tx,
-			`INSERT INTO user_prompts (sync_id, session_id, content, project) VALUES (?, ?, ?, ?)`,
-			syncID, p.SessionID, content, nullableString(p.Project),
+			`INSERT INTO user_prompts (sync_id, session_id, content, project, normalized_hash) VALUES (?, ?, ?, ?, ?)`,
+			syncID, p.SessionID, content, nullableString(p.Project), hash,
 		)
 		if err != nil {
 			return err
@@ -1916,40 +2003,6 @@ func (s *Store) SkipAckNonEnrolledMutations(targetKey string) (int64, error) {
 	return res.RowsAffected()
 }
 
-func (s *Store) AckSyncMutations(targetKey string, lastAckedSeq int64) error {
-	if lastAckedSeq <= 0 {
-		return nil
-	}
-	targetKey = normalizeSyncTargetKey(targetKey)
-	return s.withTx(func(tx *sql.Tx) error {
-		state, err := s.getSyncStateTx(tx, targetKey)
-		if err != nil {
-			return err
-		}
-		if _, err := s.execHook(tx,
-			`UPDATE sync_mutations SET acked_at = datetime('now') WHERE target_key = ? AND seq <= ? AND acked_at IS NULL`,
-			targetKey, lastAckedSeq,
-		); err != nil {
-			return err
-		}
-		acked := state.LastAckedSeq
-		if lastAckedSeq > acked {
-			acked = lastAckedSeq
-		}
-		lifecycle := SyncLifecyclePending
-		if acked >= state.LastEnqueuedSeq {
-			lifecycle = SyncLifecycleHealthy
-		}
-		_, err = s.execHook(tx,
-			`UPDATE sync_state
-			 SET last_acked_seq = ?, lifecycle = ?, updated_at = datetime('now')
-			 WHERE target_key = ?`,
-			acked, lifecycle, targetKey,
-		)
-		return err
-	})
-}
-
 // AckSyncMutationSeqs acknowledges specific mutation sequence numbers without
 // requiring them to be contiguous.
 func (s *Store) AckSyncMutationSeqs(targetKey string, seqs []int64) error {
@@ -1991,6 +2044,21 @@ func (s *Store) AckSyncMutationSeqs(targetKey string, seqs []int64) error {
 		)
 		return err
 	})
+}
+
+func (s *Store) PurgeAckedMutations(targetKey string, olderThan time.Duration) (int64, error) {
+	threshold := fmt.Sprintf("-%d seconds", int(olderThan.Seconds()))
+	res, err := s.db.Exec(
+		`DELETE FROM sync_mutations 
+		 WHERE target_key = ? 
+		   AND acked_at IS NOT NULL 
+		   AND acked_at < datetime('now', ?)`,
+		targetKey, threshold,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 func (s *Store) AcquireSyncLease(targetKey, owner string, ttl time.Duration, now time.Time) (bool, error) {
@@ -2165,6 +2233,18 @@ func (s *Store) EnrollProject(project string) error {
 		}
 		return s.backfillProjectSyncMutationsTx(tx, project)
 	})
+}
+
+// enrollProjectTx enrolls a project within an existing transaction (for auto-enroll).
+func (s *Store) enrollProjectTx(tx *sql.Tx, project string) error {
+	if project == "" {
+		return nil
+	}
+	_, err := s.execHook(tx,
+		`INSERT OR IGNORE INTO sync_enrolled_projects (project) VALUES (?)`,
+		project,
+	)
+	return err
 }
 
 // UnenrollProject removes a project from cloud sync enrollment. Idempotent —
@@ -2452,18 +2532,26 @@ func (s *Store) CountObservationsForProject(name string) (int, error) {
 
 // MergeResult summarizes the result of merging multiple project name variants
 // into a single canonical project name.
+type TopicKeyConflict struct {
+	TopicKey    string `json:"topic_key"`
+	SourceID    int64  `json:"source_id"`
+	CanonicalID int64  `json:"canonical_id"`
+}
+
 type MergeResult struct {
-	Canonical           string   `json:"canonical"`
-	SourcesMerged       []string `json:"sources_merged"`
-	ObservationsUpdated int64    `json:"observations_updated"`
-	SessionsUpdated     int64    `json:"sessions_updated"`
-	PromptsUpdated      int64    `json:"prompts_updated"`
+	Canonical           string             `json:"canonical"`
+	SourcesMerged       []string           `json:"sources_merged"`
+	ObservationsUpdated int64              `json:"observations_updated"`
+	SessionsUpdated     int64              `json:"sessions_updated"`
+	PromptsUpdated      int64              `json:"prompts_updated"`
+	TopicKeyConflicts   []TopicKeyConflict `json:"topic_key_conflicts,omitempty"`
 }
 
 // MergeProjects migrates all records from each source project name into the
 // canonical name. Sources that equal the canonical (after normalization) or
 // have no records are silently skipped — the operation is idempotent.
 // All updates are performed inside a single transaction for atomicity.
+// Topic key conflicts are resolved by keeping the most recently updated observation.
 func (s *Store) MergeProjects(sources []string, canonical string) (*MergeResult, error) {
 	canonical, _ = NormalizeProject(canonical)
 	if canonical == "" {
@@ -2479,7 +2567,62 @@ func (s *Store) MergeProjects(sources []string, canonical string) (*MergeResult,
 				continue
 			}
 
-			res, err := s.execHook(tx, `UPDATE observations SET project = ? WHERE project = ?`, canonical, src)
+			// Detect topic_key conflicts between source and canonical projects
+			// before merging. Soft-delete the older observation in case of conflict.
+			rows, err := tx.Query(`
+				SELECT src.id AS src_id, can.id AS can_id, src.topic_key, 
+				       src.updated_at AS src_updated, can.updated_at AS can_updated
+				FROM observations src
+				JOIN observations can 
+					ON src.topic_key = can.topic_key 
+					AND src.scope = can.scope
+					AND can.project = ?
+					AND can.deleted_at IS NULL
+				WHERE src.project = ?
+				  AND src.topic_key IS NOT NULL
+				  AND src.deleted_at IS NULL`,
+				canonical, src,
+			)
+			if err != nil {
+				return fmt.Errorf("detect topic_key conflicts: %w", err)
+			}
+			for rows.Next() {
+				var srcID, canID int64
+				var topicKey, srcUpdated, canUpdated string
+				if err := rows.Scan(&srcID, &canID, &topicKey, &srcUpdated, &canUpdated); err != nil {
+					rows.Close()
+					return fmt.Errorf("scan conflict: %w", err)
+				}
+				// Soft-delete the older observation (by updated_at, tie-break by id)
+				if srcUpdated >= canUpdated {
+					// Source is newer or same age, keep source, soft-delete canonical
+					if _, err := s.execHook(tx,
+						`UPDATE observations SET deleted_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`,
+						canID,
+					); err != nil {
+						rows.Close()
+						return fmt.Errorf("soft-delete canonical conflict: %w", err)
+					}
+					result.TopicKeyConflicts = append(result.TopicKeyConflicts, TopicKeyConflict{
+						TopicKey: topicKey, SourceID: srcID, CanonicalID: canID,
+					})
+				} else {
+					// Canonical is newer, soft-delete source
+					if _, err := s.execHook(tx,
+						`UPDATE observations SET deleted_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`,
+						srcID,
+					); err != nil {
+						rows.Close()
+						return fmt.Errorf("soft-delete source conflict: %w", err)
+					}
+					result.TopicKeyConflicts = append(result.TopicKeyConflicts, TopicKeyConflict{
+						TopicKey: topicKey, SourceID: canID, CanonicalID: srcID,
+					})
+				}
+			}
+			rows.Close()
+
+			res, err := s.execHook(tx, `UPDATE observations SET project = ? WHERE project = ? AND deleted_at IS NULL`, canonical, src)
 			if err != nil {
 				return fmt.Errorf("merge observations %q → %q: %w", src, canonical, err)
 			}
@@ -2881,13 +3024,25 @@ func observationPayloadFromObservation(obs *Observation) syncObservationPayload 
 	return syncObservationPayload{
 		SyncID:    obs.SyncID,
 		SessionID: obs.SessionID,
-		Type:      obs.Type,
+		Type:      normalizeObsTypeForSync(obs.Type),
 		Title:     obs.Title,
 		Content:   obs.Content,
 		ToolName:  obs.ToolName,
 		Project:   obs.Project,
 		Scope:     obs.Scope,
 		TopicKey:  obs.TopicKey,
+	}
+}
+
+// normalizeObsTypeForSync maps internal observation types to values accepted
+// by the backend API before they are stored in sync_mutations.
+// Confirmed accepted: manual, decision, architecture, bugfix, pattern, config, discovery.
+func normalizeObsTypeForSync(t string) string {
+	switch t {
+	case "manual", "decision", "architecture", "bugfix", "pattern", "config", "discovery":
+		return t
+	default:
+		return "manual"
 	}
 }
 
@@ -3096,7 +3251,7 @@ func (s *Store) migrateLegacyObservationsTable() error {
 				WHEN ROW_NUMBER() OVER (PARTITION BY id ORDER BY rowid) = 1 THEN CAST(id AS INTEGER)
 				ELSE NULL
 			END,
-			'obs-' || lower(hex(randomblob(16))),
+			(SELECT lower(substr(h, 1, 8) || '-' || substr(h, 9, 4) || '-4' || substr(h, 13, 3) || '-' || substr('89ab', (random() & 3) + 1, 1) || substr(h, 17, 3) || '-' || substr(h, 21, 12)) FROM (SELECT hex(randomblob(16)) AS h)),
 			session_id,
 			COALESCE(NULLIF(type, ''), 'manual'),
 			COALESCE(NULLIF(title, ''), 'Untitled observation'),
@@ -3359,11 +3514,18 @@ func normalizeSyncTargetKey(targetKey string) string {
 }
 
 func newSyncID(prefix string) string {
-	b := make([]byte, 8)
+	// Generate a proper UUID v4
+	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
+		// Fallback to timestamp-based ID (not ideal but better than nothing)
 		return fmt.Sprintf("%s-%d", prefix, time.Now().UTC().UnixNano())
 	}
-	return prefix + "-" + hex.EncodeToString(b)
+	// Set version (4) and variant bits for UUID v4
+	b[6] = (b[6] & 0x0f) | 0x40 // Version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // Variant RFC 4122
+
+	// Format as UUID without prefix (backend expects pure UUID)
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 func normalizeExistingSyncID(existing, prefix string) string {

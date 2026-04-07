@@ -187,6 +187,9 @@ func registerTools(srv *server.MCPServer, s *store.Store, cfg MCPConfig, allowli
 				mcp.WithString("project",
 					mcp.Description("Filter by project name"),
 				),
+				mcp.WithString("cwd",
+					mcp.Description("Current working directory of the agent. When provided and 'project' is empty, the server re-detects the project from this path."),
+				),
 				mcp.WithString("scope",
 					mcp.Description("Filter by scope: project (default) or personal"),
 				),
@@ -249,6 +252,9 @@ Examples:
 				),
 				mcp.WithString("project",
 					mcp.Description("Project name"),
+				),
+				mcp.WithString("cwd",
+					mcp.Description("Current working directory of the agent. When provided, the server re-detects the project from this path (reads .aispace-men.json, go.mod, package.json, git remote, etc.). Takes effect only when 'project' is empty."),
 				),
 				mcp.WithString("scope",
 					mcp.Description("Scope for this observation: project (default) or personal"),
@@ -384,6 +390,9 @@ Examples:
 				mcp.WithOpenWorldHintAnnotation(false),
 				mcp.WithString("project",
 					mcp.Description("Filter by project (omit for all projects)"),
+				),
+				mcp.WithString("cwd",
+					mcp.Description("Current working directory of the agent. When provided and 'project' is empty, the server re-detects the project from this path."),
 				),
 				mcp.WithString("scope",
 					mcp.Description("Filter observations by scope: project (default) or personal"),
@@ -627,15 +636,16 @@ func handleSearch(s *store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 		query, _ := req.GetArguments()["query"].(string)
 		typ, _ := req.GetArguments()["type"].(string)
 		project, _ := req.GetArguments()["project"].(string)
+		cwd, _ := req.GetArguments()["cwd"].(string)
 		scope, _ := req.GetArguments()["scope"].(string)
 		limit := intArg(req, "limit", 10)
 
-		// Apply default project when LLM sends empty
-		if project == "" {
-			project = cfg.DefaultProject
+		if strings.TrimSpace(query) == "" {
+			return mcp.NewToolResultError("query is required — provide keywords or a topic_key (e.g. 'architecture/auth-model')"), nil
 		}
-		// Normalize project name
-		project, _ = store.NormalizeProject(project)
+
+		// Resolve project: explicit param → cwd re-detection → startup default
+		project = resolveProject(project, cwd, cfg)
 
 		results, err := s.Search(query, store.SearchOptions{
 			Type:    typ,
@@ -684,16 +694,18 @@ func handleSave(s *store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 		typ, _ := req.GetArguments()["type"].(string)
 		sessionID, _ := req.GetArguments()["session_id"].(string)
 		project, _ := req.GetArguments()["project"].(string)
+		cwd, _ := req.GetArguments()["cwd"].(string)
 		scope, _ := req.GetArguments()["scope"].(string)
 		topicKey, _ := req.GetArguments()["topic_key"].(string)
 
-		// Apply default project when LLM sends empty
-		if project == "" {
-			project = cfg.DefaultProject
+		// Resolve project: explicit param → cwd re-detection → startup default
+		rawProject := project
+		project = resolveProject(project, cwd, cfg)
+		// Capture normalization warning only when LLM sent a raw name
+		var normWarning string
+		if rawProject != "" {
+			_, normWarning = store.NormalizeProject(rawProject)
 		}
-		// Normalize project name and capture warning
-		normalized, normWarning := store.NormalizeProject(project)
-		project = normalized
 
 		if typ == "" {
 			typ = "manual"
@@ -883,13 +895,11 @@ func handleSavePrompt(s *store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 func handleContext(s *store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		project, _ := req.GetArguments()["project"].(string)
+		cwd, _ := req.GetArguments()["cwd"].(string)
 		scope, _ := req.GetArguments()["scope"].(string)
 
-		// Apply default project when LLM sends empty
-		if project == "" {
-			project = cfg.DefaultProject
-		}
-		project, _ = store.NormalizeProject(project)
+		// Resolve project: explicit param → cwd re-detection → startup default
+		project = resolveProject(project, cwd, cfg)
 
 		context, err := s.FormatContext(project, scope)
 		if err != nil {
@@ -1130,6 +1140,12 @@ func handleCapturePassive(s *store.Store, cfg MCPConfig) server.ToolHandlerFunc 
 			return mcp.NewToolResultError("Passive capture failed: " + err.Error()), nil
 		}
 
+		if result.Extracted == 0 && result.Saved == 0 && result.Duplicates == 0 {
+			return mcp.NewToolResultText(
+				"No learnings extracted. Ensure content includes a '## Key Learnings:' or '## Aprendizajes Clave:' section with numbered or bulleted items (minimum 4 words each).",
+			), nil
+		}
+
 		return mcp.NewToolResultText(fmt.Sprintf(
 			"Passive capture complete: extracted=%d saved=%d duplicates=%d",
 			result.Extracted, result.Saved, result.Duplicates,
@@ -1167,6 +1183,12 @@ func handleMergeProjects(s *store.Store) server.ToolHandlerFunc {
 		msg += fmt.Sprintf("  Observations moved: %d\n", result.ObservationsUpdated)
 		msg += fmt.Sprintf("  Sessions moved:     %d\n", result.SessionsUpdated)
 		msg += fmt.Sprintf("  Prompts moved:      %d\n", result.PromptsUpdated)
+		if len(result.TopicKeyConflicts) > 0 {
+			msg += fmt.Sprintf("  Topic key conflicts resolved: %d\n", len(result.TopicKeyConflicts))
+			for _, c := range result.TopicKeyConflicts {
+				msg += fmt.Sprintf("    - %s (kept #%d, removed #%d)\n", c.TopicKey, c.SourceID, c.CanonicalID)
+			}
+		}
 
 		return mcp.NewToolResultText(msg), nil
 	}
@@ -1174,14 +1196,44 @@ func handleMergeProjects(s *store.Store) server.ToolHandlerFunc {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-// defaultSessionID returns a project-scoped default session ID.
-// If project is non-empty: "manual-save-{project}"
-// If project is empty: "manual-save"
+// defaultSessionID returns a deterministic session ID for implicit saves.
+//
+// Uses the same "manual-save-{project}" pattern as Engram so that repeated
+// mem_save calls without an explicit session_id accumulate in the SAME session
+// instead of creating a new orphaned session on every call.
+// This makes mem_context show a coherent session history rather than hundreds
+// of single-observation sessions.
 func defaultSessionID(project string) string {
 	if project == "" {
 		return "manual-save"
 	}
 	return "manual-save-" + project
+}
+
+// resolveProject applies the full project resolution chain for a single tool call.
+//
+// Priority (first non-empty wins):
+//  1. project param — the LLM explicitly set a project name
+//  2. cwd param     — re-detect from the agent's current working directory
+//  3. cfg.DefaultProject — the project detected when the MCP server started
+//
+// This enables dynamic multi-project sessions: the agent just passes its
+// current working directory and the server re-runs full detection (including
+// .aispace-men.json, go.mod, package.json, etc.) on every call.
+func resolveProject(project, cwd string, cfg MCPConfig) string {
+	if project != "" {
+		p, _ := store.NormalizeProject(project)
+		return p
+	}
+	if cwd != "" {
+		detected := projectpkg.DetectProject(cwd)
+		if detected != "" && detected != "unknown" {
+			p, _ := store.NormalizeProject(detected)
+			return p
+		}
+	}
+	p, _ := store.NormalizeProject(cfg.DefaultProject)
+	return p
 }
 
 func intArg(req mcp.CallToolRequest, key string, defaultVal int) int {
